@@ -157,7 +157,8 @@ class BrowserTransportTests(unittest.TestCase):
         source = Path("sample.pdf")
         row = Mock()
         app = SimpleNamespace(events=queue.Queue(), states={source: "running"},
-                              rows={source: row}, status=Mock(), verification_actions=Mock())
+                              rows={source: row}, status=Mock(), verification_actions=Mock(),
+                              _append_log=Mock())
         app.events.put(("stage", source, "verification", 0, 0))
         App._handle_events(app)
         app.verification_actions.grid.assert_called_once_with()

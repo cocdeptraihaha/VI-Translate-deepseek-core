@@ -20,7 +20,7 @@ import threading
 import tkinter
 import traceback
 import webbrowser
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from logging.handlers import RotatingFileHandler
@@ -389,6 +389,26 @@ def primary_action(states: Iterable[str], overwrite: bool = False) -> tuple[str,
 SERVICE_FAILURES = ("RateLimitedError", "ServiceUnavailableError")
 
 
+class QueueLogHandler(logging.Handler):
+    """Send service log records to the window without touching Tk off-thread.
+
+    A record can be emitted from the worker thread while the window is open,
+    so it goes through the same event queue as progress, never straight to a
+    widget. Nothing here echoes document text: the core's records carry
+    counters, stages and error kinds.
+    """
+
+    def __init__(self, sink: Callable[[str], None]) -> None:
+        super().__init__(level=logging.INFO)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._sink(f"{record.levelname} {record.getMessage()}")
+        except Exception:  # noqa: BLE001 - logging must never break a translation
+            self.handleError(record)
+
+
 @contextmanager
 def google_diagnostics(destination: Path) -> Iterator[None]:
     """Bounded local counters only; never record request URLs or document text."""
@@ -710,6 +730,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.rows: dict[Path, QueueRow] = {}
         self.states: dict[Path, str] = {}
         self.events: queue.Queue[tuple] = queue.Queue()
+        # A bounded history, so a 400-page book cannot grow the window's memory
+        # for a log nobody is reading.
+        self.log_lines: deque[str] = deque(maxlen=600)
+        self.log_window: ctk.CTkToplevel | None = None
+        self.log_text: ctk.CTkTextbox | None = None
+        self.log_handler = QueueLogHandler(lambda message: self.events.put(("log", message)))
+        logging.getLogger("pdf2zh").addHandler(self.log_handler)
+        logging.getLogger("pdf2zh").setLevel(logging.INFO)
         self.worker: threading.Thread | None = None
         self.translating = False
         self.batch_done = 0
@@ -1226,7 +1254,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         footer = ctk.CTkFrame(self, corner_radius=0, fg_color=CARD)
         footer.grid(row=5, column=0, sticky="ew")
         footer.grid_columnconfigure(0, weight=1)
-        self._hairline(footer).grid(row=0, column=0, columnspan=3, sticky="ew")
+        self._hairline(footer).grid(row=0, column=0, columnspan=4, sticky="ew")
 
         left = ctk.CTkFrame(footer, fg_color="transparent")
         left.grid(row=1, column=0, padx=(EDGE, GAP), pady=14, sticky="ew")
@@ -1245,16 +1273,21 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.progress.grid(row=1, column=0, pady=(PAD, 0), sticky="ew")
         left.bind("<Configure>", lambda event: self._wrap(self.status, event.width, 0))
 
+        self.log_button = self._button(
+            footer, t("log.open"), self._show_log, kind="subtle", height=36,
+        )
+        self.log_button.grid(row=1, column=1, padx=(0, PAD))
+
         self.output_link = self._button(
             footer, t("output.open_folder"), lambda: self._open(self.last_output), height=36,
         )
-        self.output_link.grid(row=1, column=1, padx=(0, PAD))
+        self.output_link.grid(row=1, column=2, padx=(0, PAD))
         self.output_link.grid_remove()
 
         self.translate_button = self._button(
             footer, t("controls.translate"), self._start, kind="primary", height=36, width=156,
         )
-        self.translate_button.grid(row=1, column=2, padx=(0, EDGE))
+        self.translate_button.grid(row=1, column=3, padx=(0, EDGE))
 
     def _show_progress(self, visible: bool) -> None:
         if visible:
@@ -1268,6 +1301,60 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
     def _set_fraction(self, fraction: float) -> None:
         self.progress.set(fraction)
         self.title(t("window.progress", percent=round(fraction * 100)))
+
+    def _show_log(self) -> None:
+        """Open the running log, or bring the open window forward."""
+        if self.log_window is not None and self.log_window.winfo_exists():
+            self.log_window.lift()
+            self.log_window.focus_force()
+            return
+        window = self._dialog(t("log.title"))
+        window.geometry("760x420")
+        window.minsize(520, 280)
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        text = ctk.CTkTextbox(
+            window, wrap="word", font=self.font(12, mono=True), fg_color=WINDOW,
+            text_color=TEXT, corner_radius=10, border_width=1, border_color=CARD_BORDER,
+        )
+        text.grid(row=0, column=0, padx=EDGE, pady=(EDGE, GAP), sticky="nsew")
+        if self.log_lines:
+            text.insert("1.0", "\n".join(self.log_lines) + "\n")
+            text.see("end")
+        text.configure(state="disabled")
+        actions = ctk.CTkFrame(window, fg_color="transparent")
+        actions.grid(row=1, column=0, padx=EDGE, pady=(0, EDGE), sticky="e")
+        self._button(actions, t("log.clear"), self._clear_log, height=34).grid(
+            row=0, column=0, padx=(0, PAD)
+        )
+        self._button(actions, t("common.close"), self._close_log, kind="subtle", height=34).grid(
+            row=0, column=1
+        )
+        self.log_window = window
+        self.log_text = text
+        window.protocol("WM_DELETE_WINDOW", self._close_log)
+
+    def _close_log(self) -> None:
+        window, self.log_window, self.log_text = self.log_window, None, None
+        if window is not None and window.winfo_exists():
+            window.destroy()
+
+    def _clear_log(self) -> None:
+        self.log_lines.clear()
+        if self.log_text is not None and self.log_window is not None and self.log_window.winfo_exists():
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+
+    def _append_log(self, message: str) -> None:
+        """Add one timestamped line, and show it if the log window is open."""
+        line = f"{datetime.now():%H:%M:%S}  {message}"
+        self.log_lines.append(line)
+        if self.log_text is not None and self.log_window is not None and self.log_window.winfo_exists():
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
 
     def _show_health_warning(self, missing: list[str]) -> None:
         self.missing_modules = list(missing)
@@ -1492,6 +1579,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             t("close.quit"), t("close.keep"), danger=True,
         ):
             return
+        logging.getLogger("pdf2zh").removeHandler(self.log_handler)
         self.destroy()
 
     def _dialog(self, title: str) -> ctk.CTkToplevel:
@@ -1898,6 +1986,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
+            if event[0] == "log":
+                self._append_log(event[1])
+                continue
             if event[0] == "status":
                 _, path, state, detail, produced = event
                 if produced is not None:
@@ -1914,6 +2005,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 row.show_actions()
                 if state == "running":
                     self._follow(row)
+                line = f"{path.name}: {t(f'log.state.{state}')}"
+                if detail:
+                    line += f" — {detail.splitlines()[0]}"
+                self._append_log(line)
             elif event[0] == "stage":
                 _, path, stage, done, total = event
                 if self.states.get(path) != "running":
@@ -1932,6 +2027,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                 if total:
                     label += t("stage.page", done=done, total=total)
                 self.status.configure(text=f"{label} · {path.name}")
+                self._append_log(f"{path.name}: {label}")
             elif event[0] == "page":
                 # Per-page progress inside the file being translated. A textbook
                 # is hundreds of pages, so file-level progress alone looks stuck.
@@ -1942,6 +2038,9 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     self._set_fraction((self.batch_done + done / total) / max(self.batch_total, 1))
                     self.status.configure(
                         text=t("status.translating_page", name=path.name, done=done, total=total)
+                    )
+                    self._append_log(
+                        t("status.translating_page", name=path.name, done=done, total=total)
                     )
             elif event[0] == "progress":
                 _, fraction, done_files, total_files = event
@@ -1983,6 +2082,7 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                     if counts["queued"]:
                         summary += t("summary.waiting", count=counts["queued"])
                 self.status.configure(text=summary)
+                self._append_log(summary)
 
 
 def verify_engine() -> None:

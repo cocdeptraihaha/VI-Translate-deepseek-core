@@ -188,6 +188,7 @@ class TranslationRecoveryTests(unittest.TestCase):
         app = SimpleNamespace(
             events=queue.Queue(), states={paths[0]: "paused", paths[1]: "queued"},
             files=paths, status=Mock(), _go_determinate=Mock(), _set_busy=Mock(),
+            _append_log=Mock(),
         )
         app.events.put(("finished",))
         App._handle_events(app)

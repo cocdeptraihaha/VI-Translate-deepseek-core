@@ -199,6 +199,7 @@ class TranslationOutcomeTests(unittest.TestCase):
             events=queue.Queue(), states={source: "running"}, files=[source],
             outputs={}, failures={}, rows={source: mock.Mock()}, status=mock.Mock(),
             _go_determinate=mock.Mock(), _show_output_link=mock.Mock(), _set_busy=mock.Mock(),
+            _append_log=mock.Mock(),
         )
         state, detail = translation_outcome(self.result(untranslated=1))
         app.events.put(("status", source, state, detail, output))
@@ -216,6 +217,7 @@ class TranslationOutcomeTests(unittest.TestCase):
         app = types.SimpleNamespace(
             events=queue.Queue(), states=dict(zip(paths, ("done", "partial", "failed"))), files=paths,
             status=mock.Mock(), _go_determinate=mock.Mock(), _set_busy=mock.Mock(),
+            _append_log=mock.Mock(),
         )
         app.events.put(("finished",))
         App._handle_events(app)
