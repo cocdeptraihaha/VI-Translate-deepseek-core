@@ -35,6 +35,8 @@ _VI: dict[str, str] = {
     ),
     "controls.overwrite": "Ghi đè file đã dịch trước đó",
     "controls.google_browser": "Google qua trình duyệt (tự chọn, tự mở xác minh)",
+    "controls.deepseek": "Dịch bằng DeepSeek (cần API key)",
+    "controls.deepseek_key": "Dán API key DeepSeek",
     "controls.translate": "Dịch",
     "controls.translate_one": "Dịch 1 file",
     "controls.translate_many": "Dịch {count} file",
@@ -56,6 +58,7 @@ _VI: dict[str, str] = {
     "status.queued": "{count} file trong hàng đợi",
     "output.open_folder": "Mở thư mục kết quả",
     "status.nothing_left": "Không còn file nào cần dịch",
+    "status.deepseek_key_required": "Nhập API key DeepSeek trước khi dịch",
     "status.preparing_pages": "Đang chuẩn bị {pages} trang…",
     "status.preparing": "Đang chuẩn bị…",
     "status.paused_verification": "Đang tạm dừng — phần đã dịch được giữ để dùng lại",
@@ -109,8 +112,9 @@ _VI: dict[str, str] = {
     "stage.ocr": "Đang nhận dạng chữ OCR",
     "stage.translating": "Đang phân tích bố cục và dịch",
     "stage.layout": "Đang phân tích bố cục",
-    "stage.request": "Đang chờ bản dịch từ Google",
+    "stage.request": "Đang chờ bản dịch",
     "stage.pacing": "Đang nghỉ giữa các yêu cầu Google",
+    "stage.glossary": "Đang lập bảng thuật ngữ cho tài liệu",
     "stage.verification": "Hãy xác minh CAPTCHA trong cửa sổ Google",
     "stage.verified": "Đã xác minh Google — đang tiếp tục dịch",
     "stage.waiting": "Kết nối gián đoạn — đang chờ thử lại",
@@ -157,11 +161,16 @@ _VI: dict[str, str] = {
         "WebView2 Runtime là lựa chọn dự phòng nếu trình duyệt không dùng được. "
         "Phần đã dịch được giữ trong bộ nhớ đệm để dùng lại."
     ),
-    "E-NET-08.summary": "Google hiện từ chối yêu cầu từ kết nối này",
+    "E-KEY-12.summary": "DeepSeek từ chối API key hoặc tài khoản",
+    "E-KEY-12.advice": (
+        "Kiểm tra API key DeepSeek đã nhập hoặc biến môi trường DEEPSEEK_API_KEY. "
+        "Key phải còn hiệu lực và tài khoản còn số dư. Phần đã dịch được giữ trong bộ nhớ đệm."
+    ),
+    "E-NET-08.summary": "Dịch vụ dịch đang tạm từ chối yêu cầu",
     "E-NET-08.advice": (
         "Đợt dịch đã tạm dừng. Các đoạn dịch thành công được lưu để dùng lại. "
         "Chọn Tiếp tục dịch sau để thử lại; hiện chưa xác định được thời gian "
-        "Google khôi phục. Không cần gửi lại liên tục."
+        "dịch vụ khôi phục. Không cần gửi lại liên tục."
     ),
     "E-NET-09.summary": "Dịch vụ dịch hiện không phản hồi hoặc từ chối truy cập",
     "E-NET-09.advice": (
@@ -241,6 +250,8 @@ _EN: dict[str, str] = {
     ),
     "controls.overwrite": "Overwrite earlier translations",
     "controls.google_browser": "Google through a browser (opens verification when needed)",
+    "controls.deepseek": "Translate with DeepSeek (API key required)",
+    "controls.deepseek_key": "Paste your DeepSeek API key",
     "controls.translate": "Translate",
     "controls.translate_one": "Translate 1 file",
     "controls.translate_many": "Translate {count} files",
@@ -262,6 +273,7 @@ _EN: dict[str, str] = {
     "status.queued": "{count} file(s) in the queue",
     "output.open_folder": "Open output folder",
     "status.nothing_left": "Nothing left to translate",
+    "status.deepseek_key_required": "Enter a DeepSeek API key before translating",
     "status.preparing_pages": "Preparing {pages} pages…",
     "status.preparing": "Preparing…",
     "status.paused_verification": "Paused — what is translated is kept for later",
@@ -315,8 +327,9 @@ _EN: dict[str, str] = {
     "stage.ocr": "Recognising text (OCR)",
     "stage.translating": "Analysing the layout and translating",
     "stage.layout": "Analysing the layout",
-    "stage.request": "Waiting for Google's translation",
+    "stage.request": "Waiting for the translation",
     "stage.pacing": "Pausing between Google requests",
+    "stage.glossary": "Building the document's glossary",
     "stage.verification": "Complete the CAPTCHA in the Google window",
     "stage.verified": "Google verified — translating again",
     "stage.waiting": "Connection lost — waiting to retry",
@@ -363,10 +376,16 @@ _EN: dict[str, str] = {
         "the WebView2 Runtime is the fallback when no browser can be used. "
         "What is translated stays in the cache for later."
     ),
-    "E-NET-08.summary": "Google is refusing requests from this connection",
+    "E-KEY-12.summary": "DeepSeek rejected the API key or the account",
+    "E-KEY-12.advice": (
+        "Check the DeepSeek API key you entered, or the DEEPSEEK_API_KEY environment "
+        "variable. The key must still be valid and the account must have balance. "
+        "What is translated stays in the cache for later."
+    ),
+    "E-NET-08.summary": "The translation service is temporarily refusing requests",
     "E-NET-08.advice": (
         "The batch is paused. Successful translations are saved for later. "
-        "Choose Continue later to try again; when Google lifts the block is unknown. "
+        "Choose Continue later to try again; when the service lifts the limit is unknown. "
         "There is no need to keep retrying."
     ),
     "E-NET-09.summary": "The translation service is not answering or refuses access",

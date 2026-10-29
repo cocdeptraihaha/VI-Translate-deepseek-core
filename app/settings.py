@@ -1,8 +1,10 @@
 """Remember the few choices a user makes once rather than per batch.
 
-Only the interface language, the target language and the bilingual layout are
-kept. OCR is deliberately not: it is slow and turns a scanned book into
-thousands of Google requests, so it stays a choice made for each batch.
+Only the interface language, the target language, the bilingual layout, the
+chosen engine and the DeepSeek key are kept. OCR is deliberately not: it is
+slow and turns a scanned book into thousands of requests, so it stays a choice
+made for each batch. The DeepSeek key is stored in this file as plain text;
+DEEPSEEK_API_KEY is used when neither the app nor the CLI supplies a key.
 
 The file lives beside the updater log, outside the install folder, so an update
 that swaps the folder keeps it. Settings are a convenience: a file that cannot
@@ -17,7 +19,7 @@ import sys
 from collections.abc import Mapping
 from pathlib import Path
 
-SETTINGS_KEYS = ("ui_language", "target_language", "bilingual")
+SETTINGS_KEYS = ("ui_language", "target_language", "bilingual", "engine", "deepseek_api_key")
 
 
 def settings_path() -> Path:

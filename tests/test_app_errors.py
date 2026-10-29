@@ -101,6 +101,14 @@ class DescribeFailureTests(unittest.TestCase):
         failure = describe_failure(raised(TimeoutError("Max retries exceeded")))
         self.assertEqual(failure.code, "E-NET-04")
 
+    def test_a_refused_deepseek_key_is_not_reported_as_a_network_outage(self):
+        failure = describe_failure(
+            raised(RuntimeError("PDF translation core failed"),
+                   RuntimeError("DeepSeek rejected the API key"))
+        )
+        self.assertEqual(failure.code, "E-KEY-12")
+        self.assertIn("DEEPSEEK_API_KEY", failure.advice)
+
     def test_an_unmapped_failure_keeps_its_original_text(self):
         failure = describe_failure(raised(RuntimeError("something nobody mapped")))
         self.assertEqual(failure.code, UNKNOWN_CODE)

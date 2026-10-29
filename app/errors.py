@@ -42,6 +42,11 @@ class Failure:
 _RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("E-VERIFY-01", ("VerificationDeferredError",)),
     ("E-BROWSER-01", ("BrowserRuntimeError",)),
+    (
+        "E-KEY-12",
+        ("DeepSeek rejected the API key", "DeepSeek API key is not configured",
+         "DeepSeek engine needs an API key", "DeepSeek reports insufficient account balance"),
+    ),
     ("E-NET-08", ("RateLimitedError",)),
     ("E-NET-09", ("ServiceUnavailableError",)),
     (

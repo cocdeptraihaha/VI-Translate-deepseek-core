@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Desktop front end for the PDF translation runner.
 
-Google mode only: a packaged executable has no agent and no API key, so the
-handoff engine is reachable from the skill rather than from here.
+Google works without a key; DeepSeek takes the key the user types and is kept
+in settings. The handoff engine is reachable from the skill rather than here,
+because a packaged executable has no agent to fill its table.
 """
 
 from __future__ import annotations
@@ -165,7 +166,7 @@ def bilingual_names() -> dict[str, str]:
 # Every stage the runner reports through on_status; each has a "stage.*" label.
 STAGES = (
     "preparing", "ocr", "translating", "layout", "request", "pacing",
-    "verification", "verified", "waiting", "saving", "bilingual",
+    "verification", "verified", "waiting", "glossary", "saving", "bilingual",
 )
 
 
@@ -402,7 +403,8 @@ def google_diagnostics(destination: Path) -> Iterator[None]:
         )
         thread_id = threading.get_ident()
         handler.addFilter(lambda record: record.thread == thread_id and
-                          record.msg == "Google translation counters: %s")
+                          record.msg in ("Google translation counters: %s",
+                                         "DeepSeek translation counters: %s"))
         handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
@@ -773,11 +775,20 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         choices = self._choices()
         overwrite = bool(self.overwrite.get())
         google_browser = bool(self.google_browser.get())
+        deepseek = bool(self.deepseek.get())
+        deepseek_key = self.deepseek_key.get()
         set_ui_language(code)
         save_settings({"ui_language": code})
-        self._rebuild(choices, overwrite, google_browser)
+        self._rebuild(choices, overwrite, google_browser, deepseek, deepseek_key)
 
-    def _rebuild(self, choices: tuple[str, str, str], overwrite: bool, google_browser: bool) -> None:
+    def _rebuild(
+        self,
+        choices: tuple[str, str, str],
+        overwrite: bool,
+        google_browser: bool,
+        deepseek: bool = False,
+        deepseek_key: str = "",
+    ) -> None:
         """Recreate every widget in the current language.
 
         Rows keep the words they were given: a finished batch is history, and
@@ -796,8 +807,14 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._show_hints()
         if overwrite:
             self.overwrite.select()
-        if not google_browser:
+        if deepseek:
+            self.deepseek.select()
+            self.deepseek_key.delete(0, "end")
+            if deepseek_key:
+                self.deepseek_key.insert(0, deepseek_key)
+        if not google_browser or deepseek:
             self.google_browser.deselect()
+        self._toggle_deepseek()
 
         for index, path in enumerate(self.files):
             row = self._new_row(path, index)
@@ -1062,13 +1079,40 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self._hairline(card).grid(row=3, column=0, columnspan=3, padx=GAP, pady=(14, 0), sticky="ew")
         self.overwrite = self._checkbox(card, t("controls.overwrite"), command=self._refresh_primary)
         self.google_browser = self._checkbox(card, t("controls.google_browser"))
+        self.deepseek = self._checkbox(card, t("controls.deepseek"), command=self._toggle_deepseek)
+        self.deepseek_key = ctk.CTkEntry(
+            card, placeholder_text=t("controls.deepseek_key"), show="•", height=32,
+            corner_radius=8, border_width=0, fg_color=FIELD, text_color=TEXT,
+            placeholder_text_color=MUTED, font=self.font(13),
+        )
         browser = sys.platform in ("win32", "darwin")
         self.overwrite.grid(
-            row=4, column=0, columnspan=3, padx=GAP, pady=(12, 0 if browser else 14), sticky="w"
+            row=4, column=0, columnspan=3, padx=GAP, pady=(12, 0 if browser else 8), sticky="w"
         )
         if browser:
-            self.google_browser.grid(row=5, column=0, columnspan=3, padx=GAP, pady=(8, 14), sticky="w")
+            self.google_browser.grid(row=5, column=0, columnspan=3, padx=GAP, pady=(8, 0), sticky="w")
             self.google_browser.select()
+        self.deepseek.grid(row=6, column=0, columnspan=3, padx=GAP, pady=(8, 0), sticky="w")
+        self.deepseek_key.grid(row=7, column=0, columnspan=3, padx=GAP, pady=(6, 0), sticky="ew")
+        if self.settings.get("engine") == "deepseek":
+            self.deepseek.select()
+        key = self.settings.get("deepseek_api_key", "")
+        if key:
+            self.deepseek_key.insert(0, key)
+        self._toggle_deepseek()
+
+    def _toggle_deepseek(self) -> None:
+        """Show the key field only for the engine that needs it, and pick one engine."""
+        on = bool(self.deepseek.get())
+        if on:
+            self.deepseek_key.grid(pady=(6, 14))
+            if self.google_browser.get():
+                self.google_browser.deselect()
+        else:
+            self.deepseek_key.grid_remove()
+        if sys.platform in ("win32", "darwin") and not self.translating:
+            self.google_browser.configure(state="disabled" if on else "normal")
+        self._show_hints()
 
     def _show_hints(self) -> None:
         _, ocr, bilingual = self._choices()
@@ -1394,9 +1438,11 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         state = "disabled" if busy else "normal"
         for widget in (
             self.language, self.ocr, self.bilingual, self.overwrite, self.google_browser,
-            self.clear_button, self.ui_language_menu,
+            self.deepseek, self.deepseek_key, self.clear_button, self.ui_language_menu,
         ):
             widget.configure(state=state)
+        if not busy:
+            self._toggle_deepseek()
         for row in self.rows.values():
             row.set_removable(not busy)
         if busy:
@@ -1604,8 +1650,22 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
             return
 
         language, ocr, bilingual = self._choices()
-        google_browser = sys.platform in ("win32", "darwin") and bool(self.google_browser.get())
-        save_settings({"target_language": language, "bilingual": bilingual})
+        deepseek = bool(self.deepseek.get())
+        engine = "deepseek" if deepseek else "google"
+        deepseek_api_key = self.deepseek_key.get().strip()
+        if deepseek and not deepseek_api_key and not os.environ.get("DEEPSEEK_API_KEY"):
+            self.status.configure(text=t("status.deepseek_key_required"))
+            return
+        google_browser = (
+            sys.platform in ("win32", "darwin") and not deepseek
+            and bool(self.google_browser.get())
+        )
+        save_settings({
+            "target_language": language,
+            "bilingual": bilingual,
+            "engine": engine,
+            "deepseek_api_key": deepseek_api_key,
+        })
 
         for path in pending:
             # Waiting again, so a retried file does not show its last error.
@@ -1627,7 +1687,10 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         self.batch_done, self.batch_total = 0, len(pending)
         self.worker = threading.Thread(
             target=self._run,
-            args=(pending, language, overwrite, ocr, google_browser, bilingual),
+            args=(
+                pending, language, overwrite, ocr, google_browser, bilingual,
+                engine, deepseek_api_key,
+            ),
             daemon=True,
         )
         self.worker.start()
@@ -1656,6 +1719,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
         ocr: str,
         google_browser: bool = False,
         bilingual: str = DEFAULT_BILINGUAL,
+        engine: str = "google",
+        deepseek_api_key: str = "",
     ) -> None:
         for index, path in enumerate(files, 1):
             self.events.put(("status", path, "running", "", None))
@@ -1679,6 +1744,8 @@ class App(ctk.CTk, TkinterDnD.DnDWrapper):
                         on_status=stage,
                         ocr=ocr,
                         bilingual=bilingual,
+                        engine=engine,
+                        deepseek_api_key=deepseek_api_key or None,
                         **browser_options,
                     )
                 state, detail = translation_outcome(result)
