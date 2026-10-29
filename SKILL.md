@@ -28,9 +28,15 @@ Use the interpreter inside `<skill-root>/.venv`:
 | Mode | Translator | Use when |
 | --- | --- | --- |
 | Google (default) | `translate.google.com` | Books, batches, first drafts, or low token use |
+| DeepSeek | `api.deepseek.com` (`DEEPSEEK_API_KEY`) | Consistent terminology and document context, paid per token |
 | Handoff | The active agent | Terminology, context, or translation quality matters |
 
-Default to Google. Offer handoff when the user asks for higher quality, rejects the Google result, or provides a short technical document.
+Default to Google. Offer DeepSeek when the user wants consistent terminology and
+supplies a key; it builds a document glossary once and sends each page as one
+context-carrying request. Offer handoff when the user asks for higher quality,
+rejects the Google result, or provides a short technical document. DeepSeek
+sends the document sample, title, outline and segments to DeepSeek; ask before
+sending sensitive material, as with Google.
 
 ## Boundaries
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import logging
@@ -93,6 +94,14 @@ class VerificationDeferredError(ServiceUnavailableError):
 
 class InvalidResponseError(RuntimeError):
     """A successful HTTP response without usable translated text."""
+
+
+class DeepSeekAuthError(ServiceUnavailableError):
+    """DeepSeek refused the key or the account has no balance.
+
+    Sending the same request again cannot fix either, so this is not treated
+    as an outage and never spends the document's retry budget.
+    """
 
 
 # Sending these again repeats a verdict, or a wait the whole document already paid.
@@ -443,6 +452,24 @@ def normalise_number_abbreviation(text: str) -> str:
     ("there is no. Then...") is left alone.
     """
     return NUMBER_ABBREVIATION_PATTERN.sub("No.", text)
+
+
+ACRONYM_PATTERN = re.compile(r"\b[A-Z][A-Z0-9]{1,}\b")
+
+
+def restore_spaced_acronyms(source: str, translated: str) -> str:
+    """Rejoin an acronym the translator spaced out, only one the source spells.
+
+    DeepSeek returned "RCAS" as "R C AS" and the spaces reached the page. The
+    token has to be an all-caps word of the source, so ordinary prose is never
+    rewritten on a guess; matching tolerates spaces between any of its letters.
+    """
+    for token in dict.fromkeys(ACRONYM_PATTERN.findall(source)):
+        pattern = re.compile(
+            r"\b" + r"\s*".join(re.escape(letter) for letter in token) + r"\b"
+        )
+        translated = pattern.sub(token, translated)
+    return translated
 
 
 class BaseTranslator:
@@ -946,6 +973,461 @@ class HandoffTranslator(BaseTranslator):
                 stream.write(json.dumps({"src": text}, ensure_ascii=False) + "\n")
 
 
+DEEPSEEK_ENDPOINT = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_GLOSSARY_DIRECTORY = os.path.join(
+    os.path.expanduser("~"), ".cache", "pdf2zh", "deepseek-glossary"
+)
+
+
+def _json_object(value: str) -> dict[str, Any]:
+    """Read the JSON object in a chat answer, tolerating a fenced code block."""
+    text = re.sub(r"^```(?:json)?\s*", "", value.strip())
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise InvalidResponseError("DeepSeek did not return a JSON object")
+    try:
+        data = json.loads(text[start : end + 1])
+    except ValueError:
+        raise InvalidResponseError("DeepSeek returned malformed JSON") from None
+    if not isinstance(data, dict):
+        raise InvalidResponseError("DeepSeek returned JSON that is not an object")
+    return data
+
+
+class DeepSeekTranslator(BaseTranslator):
+    """Translate through DeepSeek's chat API with the document's own context.
+
+    A page's segments travel in one request as a JSON array, so the model can
+    read a paragraph beside its neighbours and keep terms consistent. Before
+    the first request one extra chat call turns the document sample into a
+    glossary, which every later request carries; the glossary is kept beside
+    the translation cache so a second run of the same file reuses it.
+
+    The cache is keyed on a digest of that context, so changing the document or
+    the glossary never serves a translation made under the other one.
+    """
+
+    name = "deepseek"
+    DEFAULT_MODEL = "deepseek-chat"
+    BATCH_CHARACTERS = 6000
+    BATCH_SEGMENTS = 40
+    MAXIMUM_SEGMENT_CHARACTERS = 12000
+    GLITCH_ATTEMPTS = 2
+    GLOSSARY_TERMS = 30
+
+    def __init__(
+        self,
+        lang_in: str,
+        lang_out: str,
+        model: str | None = None,
+        *,
+        ignore_cache: bool = False,
+        envs: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        envs = envs or {}
+        self.api_key = str(envs.get("deepseek_api_key") or "").strip()
+        if not self.api_key:
+            raise ValueError(
+                "DeepSeek API key is not configured; set DEEPSEEK_API_KEY or enter one in the app"
+            )
+        self.endpoint = str(envs.get("deepseek_endpoint") or DEEPSEEK_ENDPOINT)
+        context = envs.get("document_context")
+        self.document_context: dict[str, Any] = context if isinstance(context, dict) else {}
+        super().__init__(
+            lang_in,
+            lang_out,
+            model or self.DEFAULT_MODEL,
+            ignore_cache=ignore_cache,
+            **kwargs,
+        )
+        self.session = requests.Session()
+        self.headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        self.outage = OutageBackoff()
+        self.sleep: Callable[[float], None] = time.sleep
+        self.on_status: Callable[[str, int, int], None] | None = None
+        self.stats: Counter[str] = Counter()
+        self._terminal_error: RateLimitedError | ServiceUnavailableError | None = None
+        self._glossary: dict[str, str] = {}
+        self._context_lock = threading.Lock()
+        self._context_ready = False
+
+    # -- context -----------------------------------------------------------
+    def _ensure_context(self) -> None:
+        """Build the glossary once, then key the cache on the context it used."""
+        with self._context_lock:
+            if self._context_ready:
+                return
+            self._context_ready = True
+            sample = str(self.document_context.get("sample") or "")[:20000]
+            if sample:
+                cached = self._load_glossary(sample)
+                if cached is not None:
+                    self._glossary = cached
+                    self.stats["glossary_cached"] += 1
+                else:
+                    try:
+                        self._glossary = self._build_glossary(sample)
+                        self._save_glossary(sample, self._glossary)
+                        self.stats["glossary_built"] += 1
+                    except (RateLimitedError, ServiceUnavailableError):
+                        raise
+                    except Exception as error:  # noqa: BLE001 - a glossary is an aid, not a gate
+                        logger.warning(
+                            "DeepSeek glossary skipped: %s", type(error).__name__
+                        )
+                        self._glossary = {}
+            digest = hashlib.sha256(
+                json.dumps(
+                    {"context": self.document_context, "glossary": self._glossary},
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()[:16]
+            self.cache.update_params({"context": digest})
+
+    def _glossary_path(self, sample: str) -> str:
+        digest = hashlib.sha256(
+            json.dumps(
+                [self.lang_in, self.lang_out, self.model, sample],
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        return os.path.join(DEEPSEEK_GLOSSARY_DIRECTORY, f"{digest}.json")
+
+    def _load_glossary(self, sample: str) -> dict[str, str] | None:
+        try:
+            with open(self._glossary_path(sample), encoding="utf-8") as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return {
+            str(source): str(target)
+            for source, target in data.items()
+            if str(source).strip() and str(target).strip()
+        }
+
+    def _save_glossary(self, sample: str, glossary: dict[str, str]) -> None:
+        path = self._glossary_path(sample)
+        staged = f"{path}.tmp"
+        try:
+            os.makedirs(DEEPSEEK_GLOSSARY_DIRECTORY, exist_ok=True)
+            with open(staged, "w", encoding="utf-8") as stream:
+                json.dump(glossary, stream, ensure_ascii=False)
+            os.replace(staged, path)
+        except OSError as error:
+            logger.debug("Could not record the DeepSeek glossary: %s", error)
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
+
+    def _build_glossary(self, sample: str) -> dict[str, str]:
+        system = (
+            "You prepare a bilingual glossary for a PDF translation. Return only a JSON "
+            "object whose keys are source-language terms found in the sample and whose "
+            f"values are their established translations in the target language. Choose at "
+            f"most {self.GLOSSARY_TERMS} multi-word or specialist terms; skip ordinary "
+            "words. Return {} when the sample holds no such term."
+        )
+        user = f"Source language: {self.lang_in}\nTarget language: {self.lang_out}\n\n{sample}"
+        if self.on_status is not None:
+            self.on_status("glossary", 0, 0)
+        content = self._chat(
+            {
+                "model": self.model,
+                "temperature": 0,
+                "max_tokens": 1200,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+        )
+        data = _json_object(content)
+        return {
+            str(source).strip(): str(target).strip()
+            for source, target in data.items()
+            if isinstance(source, str)
+            and isinstance(target, str)
+            and source.strip()
+            and target.strip()
+        }
+
+    def _system_prompt(self, texts: Sequence[str] = ()) -> str:
+        source = "the source language you detect" if self.lang_in == "auto" else self.lang_in
+        lines = [
+            "You translate PDF text for a layout-preserving engine.",
+            f"Translate from {source} into the language whose ISO 639-1 code is "
+            f"{self.lang_out!r}.",
+            'Return only one JSON object: {"translations": [{"id": 1, "text": "..."}]}.',
+            "Give exactly one entry for every id, in the given order, and translate each "
+            "segment completely. Never summarise, merge, split or explain a segment.",
+            "Keep every inline tag byte for byte: <bN></bN> surrounds a protected formula, "
+            "number or symbol; <s1></s1>, <s2></s2> and <s3></s3> are bold, italic and "
+            "bold-italic runs. Translate the words around them, keep both tags of every "
+            "pair, and keep the pairs balanced and in the same order.",
+            "Keep numbers, units, citation markers, code, URLs and e-mail addresses unchanged.",
+            "Keep proper names, acronyms, initialisms and product or model codes exactly as "
+            "written (RCAS, IEEE, ISO 9001). Never insert spaces between their letters.",
+        ]
+        context = self.document_context
+        metadata: list[str] = []
+        for key, label in (("title", "Title"), ("subject", "Subject"), ("author", "Author")):
+            value = str(context.get(key) or "").strip()
+            if value:
+                metadata.append(f"{label}: {value[:300]}")
+        outline = str(context.get("outline") or "").strip()
+        if outline:
+            # The title already names the document; a long outline was repeated
+            # in every request and bought little.
+            metadata.append("Outline:\n" + outline[:800])
+        if metadata:
+            lines += ["", "Document context:", "\n".join(metadata)]
+        glossary = self._relevant_glossary(texts)
+        if glossary:
+            lines += ["", "Glossary (use these translations consistently):"]
+            lines += [f"- {source} => {target}" for source, target in glossary]
+        return "\n".join(lines)
+
+    def _relevant_glossary(self, texts: Sequence[str]) -> list[tuple[str, str]]:
+        """Only the terms this batch actually spells, so every request is lighter.
+
+        A term that does not appear in the batch cannot guide it; sending the
+        whole glossary to every page was the largest repeated token cost.
+        """
+        if not self._glossary or not texts:
+            return []
+        haystack = "\n".join(texts)
+        matched = [
+            (source, target)
+            for source, target in self._glossary.items()
+            if re.search(rf"(?<!\w){re.escape(source)}(?!\w)", haystack, re.IGNORECASE)
+        ]
+        return matched[: self.GLOSSARY_TERMS]
+
+    # -- translation -------------------------------------------------------
+    def do_translate(self, text: str) -> str:
+        if len(text) > self.MAXIMUM_SEGMENT_CHARACTERS:
+            raise SegmentTooLongError(
+                f"segment of {len(text)} characters exceeds the "
+                f"{self.MAXIMUM_SEGMENT_CHARACTERS} this engine sends"
+            )
+        self._ensure_context()
+        translated = self._retrying(lambda: self._translate_joined([text]))[0]
+        return restore_spaced_acronyms(text, translated)
+
+    def translate_many(self, texts: Sequence[str]) -> list[str | Exception]:
+        """Translate a page's segments in one request, caching what is safe to reuse."""
+        self._ensure_context()
+        keys = [normalise_number_abbreviation(text) for text in texts]
+        answers: dict[str, str | Exception] = {}
+        waiting: list[str] = []
+        for key in dict.fromkeys(keys):
+            cached = None if self.ignore_cache else self.cache.get(key)
+            if cached is not None:
+                try:
+                    restore_formula_placeholders(key, cached)
+                except FormulaPlaceholderError:
+                    cached = None
+            if cached is None:
+                waiting.append(key)
+            else:
+                # Cached before this repair existed: an acronym already spaced
+                # out in the database is fixed on the way out too.
+                answers[key] = restore_spaced_acronyms(key, cached)
+                self.stats["cache_hits"] += 1
+        self.stats["segments"] += len(keys)
+        for batch in self._batches(waiting):
+            self._translate_batch(batch, answers)
+        logger.info("DeepSeek translation counters: %s", dict(self.stats))
+        return [answers[key] for key in keys]
+
+    def _batches(self, texts: Sequence[str]) -> Iterator[list[str]]:
+        batch: list[str] = []
+        used = 0
+        for text in texts:
+            size = len(text)
+            if size > self.BATCH_CHARACTERS:
+                yield [text]
+                continue
+            if batch and (
+                used + size > self.BATCH_CHARACTERS or len(batch) >= self.BATCH_SEGMENTS
+            ):
+                yield batch
+                batch, used = [], 0
+            used += size
+            batch.append(text)
+        if batch:
+            yield batch
+
+    def _translate_batch(self, batch: list[str], answers: dict[str, str | Exception]) -> None:
+        if self._terminal_error is not None:
+            for text in batch:
+                answers[text] = self._terminal_error
+            return
+        try:
+            lines = self._retrying(lambda: self._translate_joined(batch))
+        except (InvalidResponseError, SegmentRejectedError) as error:
+            # A batch the model could not answer whole is split until the
+            # offending segment stands alone; only that segment stays behind.
+            if len(batch) == 1:
+                answers[batch[0]] = error
+                return
+            self.stats["batch_splits"] += 1
+            middle = len(batch) // 2
+            self._translate_batch(batch[:middle], answers)
+            self._translate_batch(batch[middle:], answers)
+            return
+        except Exception as error:  # noqa: BLE001 - reported per segment by the caller
+            if isinstance(error, (RateLimitedError, ServiceUnavailableError)):
+                self._terminal_error = error
+            for text in batch:
+                answers[text] = error
+            return
+        for text, line in zip(batch, lines):
+            try:
+                restore_formula_placeholders(text, line)
+            except FormulaPlaceholderError as error:
+                answers[text] = error
+                continue
+            line = restore_spaced_acronyms(text, line)
+            answers[text] = line
+            if not self.ignore_cache:
+                self.cache.set(text, line)
+
+    def _translate_joined(self, batch: list[str]) -> list[str]:
+        content = self._chat(
+            {
+                "model": self.model,
+                "temperature": 0.2,
+                "max_tokens": 8192,
+                "messages": [
+                    {"role": "system", "content": self._system_prompt(batch)},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "segments": [
+                                    {"id": number, "text": text}
+                                    for number, text in enumerate(batch, 1)
+                                ]
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+            }
+        )
+        return self._parse_translations(content, len(batch))
+
+    @staticmethod
+    def _parse_translations(content: str, count: int) -> list[str]:
+        items = _json_object(content).get("translations")
+        if not isinstance(items, list) or len(items) != count:
+            raise InvalidResponseError(
+                f"{count} segments did not come back as {count} translations"
+            )
+        result: list[str | None] = [None] * count
+        for item in items:
+            if not isinstance(item, dict):
+                raise InvalidResponseError("DeepSeek returned a malformed translation entry")
+            try:
+                index = int(item["id"]) - 1
+            except (KeyError, TypeError, ValueError):
+                raise InvalidResponseError("DeepSeek returned an entry without a valid id") from None
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                raise InvalidResponseError("DeepSeek returned an empty translation")
+            if not 0 <= index < count or result[index] is not None:
+                raise InvalidResponseError("DeepSeek returned an unknown or repeated id")
+            result[index] = text
+        if any(text is None for text in result):
+            raise InvalidResponseError("DeepSeek left a segment out of its answer")
+        return [text for text in result if text is not None]
+
+    def _retrying(self, attempt: Callable[[], Any]) -> Any:
+        """Repeat a request only for an unusable answer, once."""
+        for number in range(1, self.GLITCH_ATTEMPTS + 1):
+            try:
+                return attempt()
+            except InvalidResponseError:
+                if number == self.GLITCH_ATTEMPTS:
+                    raise
+                self.sleep(float(number))
+        raise AssertionError("unreachable")
+
+    def _chat(self, payload: dict[str, Any]) -> str:
+        """Send one chat request, waiting out an outage the way Google's path does."""
+        while True:
+            started = self.outage.before_request()
+            if self.on_status is not None:
+                self.on_status("request", 0, 0)
+            try:
+                data = self._post(payload)
+            except DeepSeekAuthError:
+                raise
+            except ServiceUnavailableError as error:
+                self.outage.failed(started, error)
+                continue
+            self.outage.succeeded(started)
+            return self._content(data)
+
+    def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.stats["requests"] += 1
+        try:
+            response = self.session.post(
+                self.endpoint,
+                json=payload,
+                headers=self.headers,
+                timeout=(15, 180),
+            )
+        except (requests.ConnectionError, requests.Timeout) as error:
+            raise ServiceUnavailableError(
+                f"DeepSeek could not be reached ({type(error).__name__})"
+            ) from None
+        status = response.status_code
+        if status in (401, 403):
+            raise DeepSeekAuthError("DeepSeek rejected the API key")
+        if status == 402:
+            raise DeepSeekAuthError("DeepSeek reports insufficient account balance")
+        if status == 429:
+            raise RateLimitedError("DeepSeek is rate limiting this account")
+        if status == 400:
+            raise SegmentRejectedError("DeepSeek rejected the request as malformed or too large")
+        if status >= 500:
+            raise ServiceUnavailableError(f"DeepSeek answered HTTP {status}")
+        if status >= 400:
+            raise ServiceUnavailableError(f"DeepSeek answered HTTP {status}")
+        try:
+            data = response.json()
+        except ValueError:
+            raise InvalidResponseError("DeepSeek answered with something that is not JSON") from None
+        if not isinstance(data, dict):
+            raise InvalidResponseError("DeepSeek answered with JSON that is not an object")
+        return data
+
+    @staticmethod
+    def _content(data: dict[str, Any]) -> str:
+        try:
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            raise InvalidResponseError("DeepSeek returned no translated text") from None
+        if choice.get("finish_reason") == "length":
+            raise InvalidResponseError("DeepSeek's answer was cut off before it was complete")
+        if not isinstance(content, str) or not content.strip():
+            raise InvalidResponseError("DeepSeek returned an empty answer")
+        return content
+
+
 ENGINES: dict[str, type[BaseTranslator]] = {
-    engine.name: engine for engine in (GoogleTranslator, HandoffTranslator)
+    engine.name: engine
+    for engine in (GoogleTranslator, DeepSeekTranslator, HandoffTranslator)
 }

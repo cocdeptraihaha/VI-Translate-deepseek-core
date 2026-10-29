@@ -296,6 +296,26 @@ answer gets three quick attempts. Nothing resends a segment the service refused
 domains or keys to dodge a block. Finished segments are cached, so a later run
 of the same file sends only what is still missing.
 
+### DeepSeek
+
+`DeepSeekTranslator` (`--engine deepseek`, GUI "Dịch bằng DeepSeek") sends a
+page's segments in one OpenAI-compatible chat request as a JSON array with
+numbered ids and requires a JSON object back, so segment order and count are
+checked rather than trusted. Before the first request it builds a glossary from
+a sample spread across the document (`_document_context` in the CLI, capped at
+20k characters) plus the PDF's title, subject, author and outline; the glossary
+is cached by document digest under `~/.cache/pdf2zh/deepseek-glossary/` and
+carried by every batch prompt. The cache key includes a digest of that context,
+so a changed glossary never reuses an old translation. A malformed answer is
+retried once, then its batch is halved until the offending segment stands alone.
+`<bN></bN>` and `<sN>` validation is the same as Google's. A refused key (401/403)
+or empty balance (402) is a `DeepSeekAuthError`: it aborts the document at once
+instead of spending the outage budget, and the GUI reports E-KEY-12. HTTP 429 is
+a `RateLimitedError`, as for Google. The key comes from the GUI field (stored in
+`settings.json`, plain text), `--deepseek-api-key`, or `DEEPSEEK_API_KEY`, in
+that order. Google's `NetworkBlock` does not apply: a paid API has no CAPTCHA
+verdict and is not persisted across runs.
+
 ## Large Documents
 
 The engine produces mono output only; do not construct the engine's unused

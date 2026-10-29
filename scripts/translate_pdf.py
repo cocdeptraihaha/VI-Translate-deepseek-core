@@ -40,7 +40,8 @@ TARGET_LANGUAGES = frozenset(
     }
 )
 
-ENGINES = ("google", "handoff")
+ENGINES = ("google", "deepseek", "handoff")
+DEEPSEEK_MODEL = "deepseek-chat"
 OCR_MODES = ("off", "standard", "enhanced")
 # Off by default: the mono file is the product, and a bilingual copy of a
 # textbook is a second file of about the same size again.
@@ -195,6 +196,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--google-browser", action="store_true",
         help="Use a Google browser session with user-completed verification on Windows or macOS",
+    )
+    parser.add_argument(
+        "--deepseek-api-key",
+        help="DeepSeek API key; DEEPSEEK_API_KEY is read when this is omitted",
+    )
+    parser.add_argument(
+        "--deepseek-model", default=DEEPSEEK_MODEL,
+        help=f"DeepSeek model name (default: {DEEPSEEK_MODEL})",
     )
     parser.add_argument(
         "--ocr",
@@ -366,6 +375,42 @@ def preload_layout_model() -> None:
         pass
 
 
+def _document_context(source: Path) -> dict[str, Any]:
+    """Read the title, outline and a text sample the DeepSeek prompt carries.
+
+    One page of a textbook says little about its subject, so the sample is
+    spread across the document rather than taken from the first pages. This is
+    an aid to the translator, never a gate: an unreadable PDF returns nothing
+    and the core reports the real failure when it opens the file.
+    """
+    try:
+        import pymupdf
+
+        with pymupdf.open(source) as document:
+            metadata = document.metadata or {}
+            context: dict[str, Any] = {
+                key: str(metadata.get(key) or "").strip()
+                for key in ("title", "subject", "author")
+            }
+            outline = "\n".join(
+                f"{'  ' * (level - 1)}{title}"
+                for level, title, _page in document.get_toc(simple=True)[:150]
+            )
+            pages = document.page_count
+            step = max(1, pages // 12)
+            chunks: list[str] = []
+            for number in range(0, pages, step):
+                chunk = document[number].get_text()[:4000]
+                chunks.append(chunk)
+                if sum(len(part) for part in chunks) >= 20000:
+                    break
+            context["outline"] = outline
+            context["sample"] = "\n".join(chunks)[:20000]
+            return {key: value for key, value in context.items() if value}
+    except Exception:  # noqa: BLE001 - context is an aid, never a gate
+        return {}
+
+
 def _run_engine(
     source: Path,
     temp_output: Path,
@@ -393,13 +438,18 @@ def _run_engine(
         def callback(progress: object) -> None:
             on_progress(getattr(progress, "n", 0), getattr(progress, "total", 0) or 0)
 
+    # The core reads a "service:model" pair, so a chosen model reaches the
+    # translator and its cache key instead of always falling back to the default.
+    service = engine
+    if engine == "deepseek" and envs.get("deepseek_model"):
+        service = f"deepseek:{envs['deepseek_model']}"
     arguments = dict(
         files=[str(source)],
         output=str(temp_output),
         pages=_pages_to_indices(pages),
         lang_in=source_language,
         lang_out=target_language,
-        service=engine,
+        service=service,
         thread=threads,
         model=model,
         envs=envs,
@@ -434,6 +484,8 @@ def translate_pdf(
     ocr: str = "off",
     google_browser: bool = False,
     bilingual: str = "off",
+    deepseek_api_key: str | None = None,
+    deepseek_model: str = DEEPSEEK_MODEL,
     on_progress: Callable[[int, int], None] | None = None,
     on_status: Callable[[str, int, int], None] | None = None,
 ) -> Translation:
@@ -449,6 +501,15 @@ def translate_pdf(
         if sys.platform not in ("win32", "darwin") or engine != "google":
             raise TranslationError("Google browser mode requires the Windows or macOS desktop Google engine")
         envs["google_browser"] = True
+    if engine == "deepseek":
+        key = (deepseek_api_key or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+        if not key:
+            raise TranslationError(
+                "The DeepSeek engine needs an API key: set DEEPSEEK_API_KEY "
+                "or pass --deepseek-api-key"
+            )
+        envs["deepseek_api_key"] = key
+        envs["deepseek_model"] = deepseek_model
 
     destination: Path | None = None
     destination_dir: Path | None = None
@@ -480,6 +541,10 @@ def translate_pdf(
                 "Google Translate is temporarily paused after a network refusal; "
                 "successful translations remain cached. Try again later."
             ) from error
+    if engine == "deepseek":
+        # After the overwrite check: reading the whole PDF for a context that
+        # will not be sent wastes the wait on a run that is going to stop.
+        envs["document_context"] = _document_context(source)
     if on_status:
         on_status("preparing", 0, 0)
 
@@ -762,6 +827,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             emit_segments=args.emit_segments,
             ocr=args.ocr,
             bilingual=args.bilingual,
+            deepseek_api_key=args.deepseek_api_key,
+            deepseek_model=args.deepseek_model,
             **({"google_browser": True} if args.google_browser else {}),
         )
     except TranslationError as error:

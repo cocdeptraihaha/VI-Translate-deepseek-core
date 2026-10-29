@@ -313,6 +313,20 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\translate_pdf.py INPUT.pdf --output-dir OUT
 ```
 
+### Dịch bằng DeepSeek
+
+```powershell
+$env:DEEPSEEK_API_KEY = "sk-..."
+.venv\Scripts\python.exe scripts\translate_pdf.py INPUT.pdf --output-dir OUT --engine deepseek
+```
+
+Engine gửi cả trang cho `deepseek-chat`: một request JSON cho các đoạn của
+trang, kèm tiêu đề, mục lục và bảng thuật ngữ lập một lần từ chính tài liệu, nên
+các thuật ngữ được dùng nhất quán từ đầu đến cuối. Bảng thuật ngữ được lưu tại
+`~/.cache/pdf2zh/deepseek-glossary/` để lần dịch sau không phải lập lại. Trong
+app, tick **Dịch bằng DeepSeek** và dán API key; key được lưu trong
+`settings.json` dạng văn bản thường.
+
 ### Dịch bằng Handoff
 
 ```powershell
