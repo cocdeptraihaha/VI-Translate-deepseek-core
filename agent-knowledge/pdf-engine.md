@@ -93,6 +93,18 @@ marker, and sent Mac users off to reinstall a complete app.
   from real glyph ink (`vi` = 1.10 em). A paragraph short of room reduces
   leading to that floor, then borrows the clear gap below it
   (`available_height_below`), and only then shrinks the font.
+- Link annotations are not content: their rects stay in the source text frame
+  unless moved. `pdf2zh/links.py` maps each link from the source text block it
+  sits on to the translated block that replaced it, keeping the anchor's
+  relative position; the source blocks are read before streams are patched and
+  the translated ones from a throwaway copy after, because MuPDF keeps the
+  pre-patch page cached. `get_links()` returns viewer coordinates while
+  `insert_link()` takes page coordinates, so a rotated page is derotated
+  before mapping. A link MuPDF cannot rebuild is restored, never dropped, and
+  pages with no text on either side are left alone. Only documents carrying a
+  link pay for the extra serialization. The mapping is paragraph-level: a link
+  spanning several paragraphs, or one whose paragraph reflows heavily, can
+  still sit a few points off.
 - Output fonts are never subset. `raw_string` writes glyph IDs into Identity-H
   fonts, so renumbering them silently repoints every translated character.
   A glyph-stable alternative would be a fontTools subset with `retain_gids`.

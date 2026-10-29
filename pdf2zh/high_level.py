@@ -29,6 +29,7 @@ from pdfminer.pdfparser import PDFParser
 from pymupdf import Document, Font
 
 from pdf2zh.converter import TranslateConverter
+from pdf2zh.links import relocate_links, text_blocks
 from pdf2zh.doclayout import OnnxModel
 from pdf2zh.pdfinterp import PDFPageInterpreterEx
 from pdf2zh.rules import (
@@ -788,6 +789,23 @@ def translate_stream(
     if not create_dual:
         doc_en.close()
     page_count = doc_zh.page_count
+    # Read before the streams are patched: after that the original words are
+    # gone and nothing can say where a link used to point on the page.
+    has_links = False
+    source_blocks: list[list[tuple[float, float, float, float]]] = []
+    for page in doc_zh:
+        try:
+            if page.get_links():
+                has_links = True
+                break
+        except Exception:  # noqa: BLE001 - a damaged annotation is not a failure
+            continue
+    if has_links:
+        for page in doc_zh:
+            try:
+                source_blocks.append(text_blocks(page))
+            except Exception:  # noqa: BLE001 - this page keeps its links in place
+                source_blocks.append([])
     # font_list = [("GoNotoKurrent-Regular.ttf", font_path), ("tiro", None)]
     font_id = {}
     for page in doc_zh:
@@ -828,14 +846,39 @@ def translate_stream(
         if not doc_en.is_closed:
             doc_en.close()
         raise
-    restore_descents(doc_zh, source_descents)
-
     for obj_id, ops_new in obj_patch.items():
         # ops_old=doc_en.xref_stream(obj_id)
         # print(obj_id)
         # print(ops_old)
         # print(ops_new.encode())
         doc_zh.update_stream(obj_id, ops_new.encode())
+
+    if any(source_blocks):
+        # Text extraction on doc_zh would still see the cached pre-patch page.
+        # A throwaway copy gives the translated blocks that the links map onto;
+        # only documents carrying a link pay for it. Descents stay corrected
+        # here: the source blocks were read under the same correction, and
+        # restoring first would move every word box of a positive-descent font.
+        try:
+            probe = Document(stream=doc_zh.tobytes())
+            try:
+                output_blocks = [text_blocks(page) for page in probe]
+            finally:
+                probe.close()
+        except Exception as error:  # noqa: BLE001 - a link never fails a document
+            logger.warning("Skipped link relocation: %s", type(error).__name__)
+            output_blocks = []
+        for page, before, after in zip(doc_zh, source_blocks, output_blocks):
+            try:
+                relocate_links(page, before, after)
+            except Exception as error:  # noqa: BLE001 - a link never fails a document
+                logger.warning(
+                    "Left links on page %s where they were: %s",
+                    page.number + 1,
+                    type(error).__name__,
+                )
+
+    restore_descents(doc_zh, source_descents)
 
     if create_dual:
         doc_en.insert_file(doc_zh)
